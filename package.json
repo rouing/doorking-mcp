@@ -1,14 +1,24 @@
 {
-  "name": "doorking-mcp",
+  "name": "@rouing/doorking-mcp",
   "version": "1.0.0",
-  "private": true,
   "description": "REST API-backed Model Context Protocol (MCP) server for DoorKing Gate Manager.",
   "type": "module",
   "engines": {
     "node": ">=24"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rouing/doorking-mcp.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "files": [
+    "src/"
+  ],
   "bin": {
-    "doorking-mcp": "./src/index.ts"
+    "doorking-mcp": "./src/index.ts",
+    "doorking-mcp-http": "./src/http.ts"
   },
   "scripts": {
     "start": "node src/index.ts",
