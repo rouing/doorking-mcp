@@ -1,0 +1,30 @@
+{
+  "name": "doorking-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "REST API-backed Model Context Protocol (MCP) server for DoorKing Gate Manager.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "doorking-mcp": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "start:http": "node src/http.ts",
+    "gen:types": "npx --yes orval@8.49.0",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.19.2",
+    "typescript": "^7.0.2"
+  },
+  "license": "MIT"
+}
