@@ -1,6 +1,6 @@
 {
   "name": "@rouing/doorking-mcp",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "REST API-backed Model Context Protocol (MCP) server for DoorKing Gate Manager.",
   "type": "module",
   "engines": {

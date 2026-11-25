@@ -27,6 +27,12 @@ export interface McpPolicy {
   allowWorkingCopyWrites: boolean;
   /** Allow Tier 2 physical actions (`send_to_gate` with diffHash + momentary `pulse_gate_relay`). Default: false. */
   allowPhysical: boolean;
+  /** True when the authenticated user is resident-only (hides all staff tools; exposes only granted resident relay tools). */
+  residentOnly?: boolean;
+  /** Per-gate relay allowlist explicitly granted during OAuth consent (`phone -> relay[]`). */
+  grantedRelays?: Record<string, number[]>;
+  /** True when the user opted in to exposing their own recent gate activity to this AI client. */
+  allowResidentActivity?: boolean;
 }
 
 const DEFAULT_LIMIT = 25;
@@ -66,8 +72,163 @@ export function createDoorkingMcpServer(client: DoorkingApiClient, policy: McpPo
 
   const phoneField = z.string().optional().describe('Gate phone number (digits). Optional if DOORKING_DEFAULT_GATE is set or only one gate is accessible.');
 
+  const hasGrantedRelays = Boolean(policy.grantedRelays && Object.values(policy.grantedRelays).some((list) => list.length > 0));
+
   // =========================================================================
-  // TIER 0: Read-Only Tools (always enabled)
+  // RESIDENT / PORTAL ENTRANCE TOOLS (available to residents & users who granted relay access)
+  // =========================================================================
+  if (policy.residentOnly || hasGrantedRelays) {
+    interface PortalMeLite {
+      gate: { phoneNumber: string; siteName: string };
+      unit: { directoryCode: string; name: string };
+      portal: { buzzEnabled: boolean; requirePasskeyForBuzz: boolean; buzzRelayLabels: Array<{ relay: number; name: string }> };
+    }
+    interface PortalStatusLite {
+      available: boolean;
+      busyReason?: string;
+      percent: number | null;
+      cooldownSeconds: number;
+    }
+
+    const loadGrantedEntrances = async () => {
+      const gates = await client.listGates();
+      const out: Array<{
+        phone: string;
+        gateName: string;
+        unitCode: string;
+        available: boolean;
+        status: string;
+        cooldownSeconds: number;
+        requirePasskey: boolean;
+        relays: Array<{ relay: number; name: string }>;
+      }> = [];
+      for (const g of gates) {
+        const phone = g.phoneNumber;
+        if (!phone) continue;
+        const granted = policy.grantedRelays?.[phone];
+        if (policy.grantedRelays && (!granted || !granted.length)) continue;
+        const me = await client.request<PortalMeLite>('GET', `/api/portal/gates/${encodeURIComponent(phone)}/me`).catch(() => null);
+        if (!me || !me.portal.buzzEnabled) continue;
+        const allowedRelays = granted
+          ? me.portal.buzzRelayLabels.filter((r) => granted.includes(r.relay))
+          : me.portal.buzzRelayLabels;
+        if (!allowedRelays.length) continue;
+        const st = await client.request<PortalStatusLite>('GET', `/api/portal/gates/${encodeURIComponent(phone)}/status`).catch(() => null);
+        const status = st && !st.available
+          ? `Busy${st.percent != null ? ` ${st.percent}%` : ''}`
+          : st && st.cooldownSeconds > 0
+            ? `Wait ${st.cooldownSeconds}s`
+            : 'Ready';
+        out.push({
+          phone,
+          gateName: me.gate.siteName || g.siteName || phone,
+          unitCode: me.unit.directoryCode,
+          available: st ? (st.available && st.cooldownSeconds === 0) : true,
+          status,
+          cooldownSeconds: st?.cooldownSeconds ?? 0,
+          requirePasskey: me.portal.requirePasskeyForBuzz,
+          relays: allowedRelays,
+        });
+      }
+      return out;
+    };
+
+    server.registerTool('list_my_gate_entrances', {
+      title: 'List authorized gate entrances',
+      description: 'Lists the gate entrances (relays) this AI client has been authorized to open, along with live availability and cooldown status. Never returns keypad entry codes.',
+      inputSchema: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    }, () => runTool(async () => ({ entrances: await loadGrantedEntrances() })));
+
+    server.registerTool('open_my_gate', {
+      title: 'Momentarily open an authorized gate entrance',
+      description: 'Momentarily pulses an authorized gate entrance relay (Buzz Me In) with fail-safe auto-release and 30-second cooldown. Specify relayName (e.g. "Entry") or relay index, plus optional gateName when multiple gates are linked.',
+      inputSchema: {
+        relayName: z.string().optional().describe('Entrance/relay name, e.g. "Entry" or "Exit".'),
+        relay: z.number().int().min(0).max(18).optional().describe('Optional numeric relay index (0-18).'),
+        gateName: z.string().optional().describe('Optional gate/site name or phone when you have access to multiple gates.'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    }, ({ relayName, relay, gateName }) => runTool(async () => {
+      const entrances = await loadGrantedEntrances();
+      if (!entrances.length) throw new Error('No gate entrances are authorized for this AI client.');
+      const wantedGate = (gateName || '').trim().toLowerCase();
+      const gateMatches = wantedGate
+        ? entrances.filter((e) => e.gateName.toLowerCase().includes(wantedGate) || e.phone.includes(wantedGate.replace(/\D/g, '') || '__none__'))
+        : entrances;
+      if (!gateMatches.length) {
+        throw new Error(`No gate matched "${gateName}". Available: ${entrances.map((e) => e.gateName).join(', ')}`);
+      }
+      const candidates = gateMatches.flatMap((g) => g.relays.map((r) => ({ gate: g, relay: r })));
+      const wantedRelay = (relayName || '').trim().toLowerCase();
+      let matched = candidates;
+      if (relay !== undefined) {
+        matched = candidates.filter((c) => c.relay.relay === relay);
+      } else if (wantedRelay) {
+        const exact = candidates.filter((c) => c.relay.name.toLowerCase() === wantedRelay);
+        matched = exact.length ? exact : candidates.filter((c) => c.relay.name.toLowerCase().includes(wantedRelay) || wantedRelay.includes(c.relay.name.toLowerCase()));
+      }
+      if (!matched.length) {
+        throw new Error(`No authorized entrance matched. Available: ${candidates.map((c) => `${c.relay.name} (${c.gate.gateName})`).join(', ')}`);
+      }
+      if (matched.length > 1) {
+        throw new Error(`Multiple entrances match; please specify gateName and relayName. Matches: ${matched.map((c) => `${c.relay.name} at ${c.gate.gateName}`).join(', ')}`);
+      }
+      const target = matched[0];
+      const res = await client.request<{ ok: boolean; alreadyOpen?: boolean }>(
+        'POST',
+        `/api/portal/gates/${encodeURIComponent(target.gate.phone)}/buzz`,
+        { relay: target.relay.relay, code: target.gate.unitCode },
+      );
+      return {
+        ok: true,
+        gateName: target.gate.gateName,
+        relay: target.relay.relay,
+        relayName: target.relay.name,
+        alreadyOpen: Boolean(res.alreadyOpen),
+        message: res.alreadyOpen ? `${target.relay.name} is already open.` : `${target.relay.name} opened.`,
+      };
+    }));
+
+    if (policy.allowResidentActivity) {
+      server.registerTool('get_my_recent_activity', {
+        title: 'Get my recent gate activity',
+        description: 'Lists recent gate activity strictly for your own linked unit (never exposes keypad entry codes or other residents).',
+        inputSchema: {
+          gateName: z.string().optional().describe('Optional gate/site name when multiple gates are linked.'),
+          limit: z.number().int().min(1).max(50).optional().describe('Max entries to return (default 15).'),
+        },
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      }, ({ gateName, limit = 15 }) => runTool(async () => {
+        const entrances = await loadGrantedEntrances();
+        if (!entrances.length) throw new Error('No accessible gates found.');
+        const wantedGate = (gateName || '').trim().toLowerCase();
+        const target = wantedGate
+          ? entrances.find((e) => e.gateName.toLowerCase().includes(wantedGate))
+          : entrances[0];
+        if (!target) throw new Error(`No gate matched "${gateName}".`);
+        const act = await client.request<{ rows?: Array<Record<string, unknown>> }>(
+          'GET',
+          `/api/portal/gates/${encodeURIComponent(target.phone)}/activity?code=${encodeURIComponent(target.unitCode)}`,
+        );
+        const rows = (act.rows || []).slice(0, limit).map((r) => ({
+          date: r.date,
+          time: r.time,
+          eventType: r.source === 'portal' ? 'Portal Open' : r.eventType,
+          access: r.access,
+          relay: r.relay,
+        }));
+        return { gateName: target.gateName, unitCode: target.unitCode, rows };
+      }));
+    }
+
+    if (policy.residentOnly) {
+      return server;
+    }
+  }
+
+  // =========================================================================
+  // TIER 0: Staff Read-Only Tools (non-resident accounts only)
   // =========================================================================
 
   server.registerTool('list_gates', {

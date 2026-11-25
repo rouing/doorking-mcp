@@ -14,7 +14,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { DoorkingApiClient } from './client.ts';
-import { DoorkingOAuthProvider } from './oauth.ts';
+import { DoorkingOAuthProvider, type McpGrantData } from './oauth.ts';
 import { createDoorkingMcpServer, type McpPolicy } from './server.ts';
 
 export interface HttpMcpServerOptions {
@@ -30,8 +30,8 @@ export function createDoorkingHttpApp(opts: HttpMcpServerOptions) {
   const issuerUrl = new URL(opts.publicIssuerUrl.replace(/\/+$/, ''));
   const mcpResourceUrl = new URL('/mcp', issuerUrl);
   const scopesSupported = opts.policy.allowWorkingCopyWrites
-    ? ['doorking:read', 'doorking:stage']
-    : ['doorking:read'];
+    ? ['doorking:read', 'doorking:portal', 'doorking:stage']
+    : ['doorking:read', 'doorking:portal'];
 
   const app = createMcpExpressApp({
     host: opts.host || '127.0.0.1',
@@ -83,9 +83,14 @@ export function createDoorkingHttpApp(opts: HttpMcpServerOptions) {
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
+    const isResidentOnly = auth.extra?.isResidentOnly === true;
+    const mcpGrant = (auth.extra?.mcpGrant as McpGrantData | undefined) || undefined;
     const effectivePolicy: McpPolicy = {
-      allowWorkingCopyWrites: opts.policy.allowWorkingCopyWrites && auth.scopes.includes('doorking:stage'),
-      allowPhysical: opts.policy.allowPhysical && auth.scopes.includes('doorking:stage'),
+      allowWorkingCopyWrites: !isResidentOnly && opts.policy.allowWorkingCopyWrites && auth.scopes.includes('doorking:stage'),
+      allowPhysical: !isResidentOnly && opts.policy.allowPhysical && auth.scopes.includes('doorking:stage'),
+      residentOnly: isResidentOnly,
+      grantedRelays: mcpGrant?.relays,
+      allowResidentActivity: mcpGrant?.allowActivity === true,
     };
     const defaultGate = typeof auth.extra?.gatePhone === 'string' && auth.extra.gatePhone
       ? auth.extra.gatePhone

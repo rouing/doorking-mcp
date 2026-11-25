@@ -33,15 +33,36 @@ interface IssuedCode {
   expiresAt: number;
 }
 
-interface VerifiedCacheEntry {
-  info: AuthInfo;
-  cachedUntil: number;
+export interface McpGrantData {
+  clientName: string;
+  scopes: string[];
+  relays: Record<string, number[]>;
+  allowActivity: boolean;
+}
+
+interface PortalGateRelays {
+  phone: string;
+  siteName: string;
+  relays: Array<{ relay: number; name: string; hidden: boolean }>;
+}
+
+interface BrowserSessionInfo {
+  loggedIn: boolean;
+  user?: string;
+  isResidentOnly: boolean;
+  sso: Array<{ id: string; name: string }>;
+  portalRelays: PortalGateRelays[];
 }
 
 const MAX_CLIENTS = 200;
 const CONSENT_TTL_MS = 10 * 60_000;
 const CODE_TTL_MS = 5 * 60_000;
 const VERIFY_CACHE_MS = 30_000;
+
+interface VerifiedCacheEntry {
+  info: AuthInfo;
+  cachedUntil: number;
+}
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
@@ -114,26 +135,38 @@ export class DoorkingOAuthProvider implements OAuthServerProvider {
     res.redirect(302, `/oauth/consent/${consentId}`);
   }
 
-  private async fetchBrowserSession(cookieHeader: string | undefined): Promise<{ loggedIn: boolean; user?: string; sso: Array<{ id: string; name: string }> }> {
+  private async fetchBrowserSession(cookieHeader: string | undefined): Promise<BrowserSessionInfo> {
     try {
-      const res = await fetch(`${this.apiBaseUrl}/api/session`, {
-        headers: {
-          Accept: 'application/json',
-          ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-        },
-      });
-      const data = await res.json().catch(() => ({})) as { loggedIn?: boolean; user?: string; sso?: Array<{ id: string; name: string }> };
+      const headers = {
+        Accept: 'application/json',
+        ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+      };
+      const res = await fetch(`${this.apiBaseUrl}/api/session`, { headers });
+      const data = await res.json().catch(() => ({})) as {
+        loggedIn?: boolean; user?: string; isResidentOnly?: boolean; sso?: Array<{ id: string; name: string }>;
+      };
+      const loggedIn = Boolean(res.ok && data.loggedIn && data.user);
+      let portalRelays: PortalGateRelays[] = [];
+      if (loggedIn) {
+        const meRes = await fetch(`${this.apiBaseUrl}/api/me`, { headers }).catch(() => null);
+        const meData = meRes && meRes.ok
+          ? (await meRes.json().catch(() => ({})) as { portalRelays?: PortalGateRelays[] })
+          : {};
+        if (Array.isArray(meData.portalRelays)) portalRelays = meData.portalRelays;
+      }
       return {
-        loggedIn: Boolean(res.ok && data.loggedIn && data.user),
+        loggedIn,
         user: data.user,
+        isResidentOnly: Boolean(data.isResidentOnly),
         sso: Array.isArray(data.sso) ? data.sso : [],
+        portalRelays,
       };
     } catch {
-      return { loggedIn: false, sso: [] };
+      return { loggedIn: false, isResidentOnly: false, sso: [], portalRelays: [] };
     }
   }
 
-  /** Renders `GET /oauth/consent/:id`, reusing an existing same-origin DoorKing session or offering Passkey, SSO & password. */
+  /** Renders `GET /oauth/consent/:id`: Page 1 (Sign In) if logged out, or Page 2 (Permissions & Relays) if signed in. */
   async renderConsentRequest(req: Request, res: Response): Promise<void> {
     this.sweep();
     const consentId = String(req.params.id || '');
@@ -148,15 +181,31 @@ export class DoorkingOAuthProvider implements OAuthServerProvider {
     res.type('text/html; charset=utf-8').send(
       this.renderConsentPage(consentId, consent.clientName, consent.requestedScopes, {
         signedInUser: session.loggedIn ? session.user : undefined,
+        isResidentOnly: session.isResidentOnly,
+        portalRelays: session.portalRelays,
         ssoProviders: session.sso,
       }),
     );
   }
 
+  private parseGrantedRelays(raw: unknown): Record<string, number[]> {
+    const items = Array.isArray(raw) ? raw : raw ? [raw] : [];
+    const out: Record<string, number[]> = {};
+    for (const item of items) {
+      const m = /^(\d+):(\d{1,2})$/.exec(String(item || '').trim());
+      if (!m) continue;
+      const phone = m[1];
+      const relay = Number(m[2]);
+      if (relay < 0 || relay > 18) continue;
+      out[phone] = [...new Set([...(out[phone] || []), relay])].sort((a, b) => a - b);
+    }
+    return out;
+  }
+
   /** Handles `POST /oauth/approve` from the consent form: authenticates via existing session cookie or password and redirects with an OAuth code. */
   async handleConsentSubmit(req: Request, res: Response): Promise<void> {
     this.sweep();
-    const body = (req.body || {}) as Record<string, string | undefined>;
+    const body = (req.body || {}) as Record<string, string | string[] | undefined>;
     const consentId = String(body.consent_id || '');
     const consent = this.pending.get(consentId);
     if (!consent) {
@@ -174,10 +223,18 @@ export class DoorkingOAuthProvider implements OAuthServerProvider {
     }
 
     const grantStage = this.allowWorkingCopyWrites && body.allow_stage === '1';
-    const grantedScopes = grantStage ? ['doorking:read', 'doorking:stage'] : ['doorking:read'];
+    const allowActivity = body.allow_activity === '1';
+    const grantedRelays = this.parseGrantedRelays(body.relay);
+    const hasRelayGrant = Object.keys(grantedRelays).length > 0;
+    const requestedScopes = [
+      'doorking:read',
+      ...(grantStage ? ['doorking:stage'] : []),
+      ...(hasRelayGrant ? ['doorking:portal'] : []),
+    ];
 
     let mintedToken = '';
     let resolvedUser = '';
+    let effectiveScopes = requestedScopes;
 
     if (body.use_session === '1') {
       let mintRes: globalThis.Response;
@@ -189,13 +246,18 @@ export class DoorkingOAuthProvider implements OAuthServerProvider {
             'Content-Type': 'application/json',
             ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}),
           },
-          body: '{}',
+          body: JSON.stringify({
+            clientName: consent.clientName,
+            scopes: requestedScopes,
+            relays: grantedRelays,
+            allowActivity,
+          }),
         });
       } catch {
         res.status(502).type('text/html; charset=utf-8').send(this.renderConsentPage(consentId, consent.clientName, consent.requestedScopes, { error: 'Could not reach DoorKing API.' }));
         return;
       }
-      const data = await mintRes.json().catch(() => ({})) as { error?: string; token?: string; user?: string };
+      const data = await mintRes.json().catch(() => ({})) as { error?: string; token?: string; user?: string; mcpGrant?: McpGrantData };
       if (!mintRes.ok || !data.token || !data.user) {
         const session = await this.fetchBrowserSession(undefined);
         res.status(401).type('text/html; charset=utf-8').send(
@@ -208,6 +270,7 @@ export class DoorkingOAuthProvider implements OAuthServerProvider {
       }
       mintedToken = data.token;
       resolvedUser = data.user;
+      if (data.mcpGrant?.scopes?.length) effectiveScopes = data.mcpGrant.scopes;
     } else {
       const user = String(body.user || '').trim();
       const password = String(body.password || '');
@@ -249,7 +312,7 @@ export class DoorkingOAuthProvider implements OAuthServerProvider {
       codeChallenge: consent.codeChallenge,
       dksToken: mintedToken,
       user: resolvedUser,
-      scopes: grantedScopes,
+      scopes: effectiveScopes,
       expiresAt: Date.now() + CODE_TTL_MS,
     });
 
@@ -293,16 +356,24 @@ export class DoorkingOAuthProvider implements OAuthServerProvider {
       const res = await fetch(`${this.apiBaseUrl}/api/session`, {
         headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
       });
-      const data = await res.json().catch(() => ({})) as { loggedIn?: boolean; user?: string };
+      const data = await res.json().catch(() => ({})) as {
+        loggedIn?: boolean; user?: string; isResidentOnly?: boolean; mcpGrant?: McpGrantData | null;
+      };
       if (!res.ok || !data.loggedIn || !data.user) throw new InvalidTokenError('Session token is invalid or expired');
       const meta = this.tokenScopes.get(token);
-      const scopes = meta?.scopes || (this.allowWorkingCopyWrites ? ['doorking:read', 'doorking:stage'] : ['doorking:read']);
+      const scopes = data.mcpGrant?.scopes?.length
+        ? data.mcpGrant.scopes
+        : (meta?.scopes || (this.allowWorkingCopyWrites && !data.isResidentOnly ? ['doorking:read', 'doorking:stage'] : ['doorking:read']));
       const info: AuthInfo = {
         token,
         clientId: meta?.clientId || `user:${data.user}`,
         scopes,
         expiresAt: Math.floor(Date.now() / 1000) + 1800,
-        extra: { user: data.user },
+        extra: {
+          user: data.user,
+          isResidentOnly: Boolean(data.isResidentOnly),
+          ...(data.mcpGrant ? { mcpGrant: data.mcpGrant } : {}),
+        },
       };
       this.verifyCache.set(token, { info, cachedUntil: Date.now() + VERIFY_CACHE_MS });
       return info;
@@ -350,20 +421,36 @@ export class DoorkingOAuthProvider implements OAuthServerProvider {
     consentId: string,
     clientName: string,
     requestedScopes: string[],
-    opts: { signedInUser?: string; ssoProviders?: Array<{ id: string; name: string }>; error?: string } = {},
+    opts: {
+      signedInUser?: string;
+      isResidentOnly?: boolean;
+      portalRelays?: PortalGateRelays[];
+      ssoProviders?: Array<{ id: string; name: string }>;
+      error?: string;
+    } = {},
   ): string {
-    const { signedInUser, ssoProviders = [], error = '' } = opts;
-    const stageChecked = this.allowWorkingCopyWrites && requestedScopes.includes('doorking:stage');
-    const stageBox = this.allowWorkingCopyWrites
-      ? `<label class="check"><input type="checkbox" name="allow_stage" value="1"${stageChecked ? ' checked' : ''}><span>Allow staging edits &amp; timed relay control</span></label>`
+    const { signedInUser, isResidentOnly = false, portalRelays = [], ssoProviders = [], error = '' } = opts;
+    const stageChecked = !isResidentOnly && this.allowWorkingCopyWrites && requestedScopes.includes('doorking:stage');
+    const stageBox = !isResidentOnly && this.allowWorkingCopyWrites
+      ? `<label class="check"><input type="checkbox" name="allow_stage" value="1"${stageChecked ? ' checked' : ''}><span>Allow staging edits &amp; timed relay control (Admin/Editor)</span></label>`
       : '';
     const ssoButtons = ssoProviders.map((p) => (
       `<button type="button" class="alt" data-sso="${escapeHtml(p.id)}">Sign in with ${escapeHtml(p.name)}</button>`
     )).join('');
 
+    const relaySection = portalRelays.length
+      ? `<div class="box"><div class="box-title">Gate entrances this AI client can open</div>${portalRelays.map((g) => `
+          ${portalRelays.length > 1 ? `<div class="gate-lbl">${escapeHtml(g.siteName || g.phone)}</div>` : ''}
+          ${g.relays.map((r) => `<label class="check compact"><input type="checkbox" name="relay" value="${escapeHtml(`${g.phone}:${r.relay}`)}"${!r.hidden ? ' checked' : ''}><span>${escapeHtml(r.name || `Relay ${r.relay}`)}</span></label>`).join('')}
+        `).join('')}
+        <label class="check compact" style="margin-top:8px;padding-top:8px;border-top:1px solid #334155"><input type="checkbox" name="allow_activity" value="1"><span>Allow viewing my recent gate activity</span></label>
+      </div>`
+      : '';
+
     const bodyHtml = signedInUser
-      ? `<div class="who">Signed in as <strong>${escapeHtml(signedInUser)}</strong> <a href="/oauth/consent/${escapeHtml(consentId)}?switch=1">Switch account</a></div>
+      ? `<div class="who"><span>Signed in as <strong>${escapeHtml(signedInUser)}</strong>${isResidentOnly ? ' <span class="badge">Resident</span>' : ''}</span> <a href="/oauth/consent/${escapeHtml(consentId)}?switch=1">Switch account</a></div>
   <input type="hidden" name="use_session" value="1">
+  ${relaySection}
   ${stageBox}
   <div class="row">
     <button class="no" type="submit" name="decision" value="deny" formnovalidate>Deny</button>
@@ -376,10 +463,9 @@ export class DoorkingOAuthProvider implements OAuthServerProvider {
   <div class="sep"><span>or username &amp; password</span></div>
   <label for="u">Username or email</label><input id="u" name="user" type="text" autocomplete="username" required>
   <label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password" required>
-  ${stageBox}
   <div class="row">
     <button class="no" type="submit" name="decision" value="deny" formnovalidate>Deny</button>
-    <button class="ok" type="submit" name="decision" value="approve">Sign in &amp; Authorize</button>
+    <button class="ok" type="button" id="pwNextBtn">Continue</button>
   </div>`;
 
     return `<!doctype html>
@@ -387,25 +473,30 @@ export class DoorkingOAuthProvider implements OAuthServerProvider {
 <title>Authorize DoorKing MCP</title>
 <style>
   body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;display:grid;place-items:center;min-height:100vh;margin:0;padding:16px}
-  .card{background:#1e293b;border-radius:16px;padding:24px;max-width:410px;width:100%;box-shadow:0 12px 32px rgba(0,0,0,.35)}
+  .card{background:#1e293b;border-radius:16px;padding:24px;max-width:420px;width:100%;box-shadow:0 12px 32px rgba(0,0,0,.35)}
   h1{margin:0 0 8px;font-size:1.25rem} p{margin:0 0 16px;color:#94a3b8;font-size:.92rem;line-height:1.45}
-  .who{background:#0f172a;border-radius:10px;padding:12px;margin-bottom:14px;font-size:.92rem;display:flex;justify-content:space-between;align-items:center;gap:8px}
-  .who a{color:#38bdf8;text-decoration:none;font-size:.82rem}
+  .who{background:#0f172a;border-radius:10px;padding:12px;margin-bottom:14px;font-size:.9rem;display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .who a{color:#38bdf8;text-decoration:none;font-size:.82rem;white-space:nowrap}
+  .badge{display:inline-block;background:#0369a1;color:#e0f2fe;font-size:.72rem;padding:2px 7px;border-radius:999px;margin-left:4px;vertical-align:middle}
+  .box{background:#0f172a;border-radius:12px;padding:12px 14px;margin-bottom:14px}
+  .box-title{font-size:.8rem;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px}
+  .gate-lbl{font-size:.82rem;font-weight:600;color:#cbd5e1;margin:8px 0 4px}
   .stack{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}
   .sep{display:flex;align-items:center;gap:10px;color:#64748b;font-size:.8rem;margin:14px 0}
   .sep:before,.sep:after{content:"";flex:1;height:1px;background:#334155}
   label{display:block;font-size:.85rem;margin-bottom:4px;color:#cbd5e1}
   input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:10px 12px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#f8fafc;margin-bottom:12px;font-size:.95rem}
-  .check{display:flex;gap:8px;align-items:flex-start;margin:10px 0 16px;font-size:.88rem;color:#cbd5e1}
+  .check{display:flex;gap:8px;align-items:flex-start;margin:10px 0 14px;font-size:.88rem;color:#cbd5e1;cursor:pointer}
+  .check.compact{margin:6px 0}
   .err{background:#7f1d1d;color:#fecaca;padding:10px 12px;border-radius:10px;margin-bottom:12px;font-size:.88rem}
-  .row{display:flex;gap:10px}
+  .row{display:flex;gap:10px;margin-top:8px}
   button{flex:1;padding:11px;border:0;border-radius:999px;font-weight:600;cursor:pointer;font-size:.95rem}
   .ok{background:#0284c7;color:#fff} .alt{background:#334155;color:#f8fafc} .no{background:#334155;color:#e2e8f0}
   button:disabled{opacity:.6;cursor:wait}
 </style></head>
 <body><form class="card" method="POST" action="/oauth/approve">
   <h1>DoorKing Gate Manager</h1>
-  <p><strong>${escapeHtml(clientName)}</strong> is requesting MCP access to your DoorKing account.</p>
+  <p>${signedInUser ? `Choose which permissions <strong>${escapeHtml(clientName)}</strong> should receive:` : `Sign in to choose permissions for <strong>${escapeHtml(clientName)}</strong>.`}</p>
   <div id="errBox" class="err" style="display:${error ? 'block' : 'none'}">${escapeHtml(error)}</div>
   <input type="hidden" name="consent_id" value="${escapeHtml(consentId)}">
   ${bodyHtml}
@@ -416,6 +507,25 @@ export class DoorkingOAuthProvider implements OAuthServerProvider {
   const showErr = (m) => { errBox.textContent = m; errBox.style.display = 'block'; };
   const b64uToBuf = (s) => Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/') + '='.repeat((4 - s.length % 4) % 4)), c => c.charCodeAt(0));
   const bufToB64u = (b) => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');
+
+  const pwNextBtn = document.getElementById('pwNextBtn');
+  if (pwNextBtn) {
+    pwNextBtn.addEventListener('click', async () => {
+      const u = (document.getElementById('u') || {}).value || '';
+      const p = (document.getElementById('p') || {}).value || '';
+      if (!u.trim() || !p) { showErr('Enter your username/email and password.'); return; }
+      pwNextBtn.disabled = true; errBox.style.display = 'none';
+      try {
+        const r = await fetch('/api/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: u.trim(), password: p }) });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || 'Invalid username or password');
+        window.location.href = '/oauth/consent/${escapeHtml(consentId)}';
+      } catch (e) {
+        showErr(e.message || String(e));
+        pwNextBtn.disabled = false;
+      }
+    });
+  }
 
   const pkBtn = document.getElementById('pkBtn');
   if (pkBtn) {
