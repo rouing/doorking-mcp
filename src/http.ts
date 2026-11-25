@@ -55,7 +55,10 @@ export function createDoorkingHttpApp(opts: HttpMcpServerOptions) {
     resourceName: 'DoorKing Gate Manager MCP',
   }));
 
-  // Consent form submission endpoint used by `provider.authorize()`.
+  // Consent page (checks existing same-origin DoorKing session cookie + offers Passkey & SSO) and form submission.
+  app.get('/oauth/consent/:id', (req, res) => {
+    void provider.renderConsentRequest(req, res);
+  });
   app.post('/oauth/approve', express.urlencoded({ extended: false }), (req, res) => {
     void provider.handleConsentSubmit(req, res);
   });
