@@ -186,8 +186,10 @@ export class DoorkingOAuthProvider implements OAuthServerProvider {
           method: 'POST',
           headers: {
             Accept: 'application/json',
+            'Content-Type': 'application/json',
             ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}),
           },
+          body: '{}',
         });
       } catch {
         res.status(502).type('text/html; charset=utf-8').send(this.renderConsentPage(consentId, consent.clientName, consent.requestedScopes, { error: 'Could not reach DoorKing API.' }));
